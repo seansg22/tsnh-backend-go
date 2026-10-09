@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -36,6 +38,9 @@ type request struct {
 	Username string            `json:"username"`
 	Code     string            `json:"code"`
 	Data     map[string]string `json:"data"` // raw localStorage key -> raw string value
+	// IfVersion makes push optimistic: it only succeeds if the cloud is still at this version.
+	// Omitted = force overwrite.
+	IfVersion *int64 `json:"if_version"`
 }
 
 // validate checks the trust-boundary inputs; returns "" when ok.
@@ -61,12 +66,28 @@ func fail(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
-func Handler(w http.ResponseWriter, r *http.Request) {
-	origin := os.Getenv("ALLOWED_ORIGIN")
-	if origin == "" {
-		origin = "*"
+// allowOrigin returns the value for Access-Control-Allow-Origin, or "" to send none.
+// allowed = comma-separated origins (ALLOWED_ORIGIN); empty means any origin. localhost is always allowed for dev.
+func allowOrigin(origin, allowed string) string {
+	if allowed == "" {
+		return "*"
 	}
-	w.Header().Set("Access-Control-Allow-Origin", origin)
+	if u, err := url.Parse(origin); err == nil && (u.Hostname() == "localhost" || u.Hostname() == "127.0.0.1") {
+		return origin
+	}
+	for _, a := range strings.Split(allowed, ",") {
+		if strings.TrimRight(strings.TrimSpace(a), "/") == origin {
+			return origin
+		}
+	}
+	return ""
+}
+
+func Handler(w http.ResponseWriter, r *http.Request) {
+	if o := allowOrigin(r.Header.Get("Origin"), os.Getenv("ALLOWED_ORIGIN")); o != "" {
+		w.Header().Set("Access-Control-Allow-Origin", o)
+		w.Header().Set("Vary", "Origin")
+	}
 	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 	if r.Method == http.MethodOptions {
@@ -142,7 +163,8 @@ func api(w http.ResponseWriter, r *http.Request) {
 	var code string
 	var data []byte
 	var updatedAt time.Time
-	err = p.QueryRow(ctx, `select code, data, updated_at from users where username = $1`, req.Username).Scan(&code, &data, &updatedAt)
+	var version int64
+	err = p.QueryRow(ctx, `select code, data, updated_at, version from users where username = $1`, req.Username).Scan(&code, &data, &updatedAt, &version)
 	if errors.Is(err, pgx.ErrNoRows) {
 		fail(w, http.StatusNotFound, "user not found")
 		return
@@ -160,14 +182,20 @@ func api(w http.ResponseWriter, r *http.Request) {
 	case "/login":
 		writeJSON(w, http.StatusOK, map[string]string{"username": req.Username})
 	case "/sync/pull":
-		writeJSON(w, http.StatusOK, map[string]any{"data": json.RawMessage(data), "updated_at": updatedAt})
+		writeJSON(w, http.StatusOK, map[string]any{"data": json.RawMessage(data), "updated_at": updatedAt, "version": version})
 	case "/sync/push":
-		// ponytail: last-write-wins whole snapshot, no merge/versioning.
-		err = p.QueryRow(ctx, `update users set data = $2, updated_at = now() where username = $1 returning updated_at`, req.Username, req.Data).Scan(&updatedAt)
+		// Merging is done client-side (3-way); the server only guards against lost updates via version.
+		err = p.QueryRow(ctx, `update users set data = $2, version = version + 1, updated_at = now()
+			where username = $1 and ($3::bigint is null or version = $3) returning updated_at, version`,
+			req.Username, req.Data, req.IfVersion).Scan(&updatedAt, &version)
+		if errors.Is(err, pgx.ErrNoRows) {
+			fail(w, http.StatusConflict, "conflict")
+			return
+		}
 		if err != nil {
 			fail(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"updated_at": updatedAt})
+		writeJSON(w, http.StatusOK, map[string]any{"updated_at": updatedAt, "version": version})
 	}
 }

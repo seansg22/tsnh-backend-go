@@ -9,17 +9,34 @@ func TestValidate(t *testing.T) {
 		needData bool
 		valid    bool
 	}{
-		{request{"mimi_01", "123456", nil}, false, true},
-		{request{"ab", "123456", nil}, false, false},
-		{request{"Mimi", "123456", nil}, false, false},
-		{request{"mimi", "12345", nil}, false, false},
-		{request{"mimi", "12345a", nil}, false, false},
-		{request{"mimi", "123456", nil}, true, false},
-		{request{"mimi", "123456", ok}, true, true},
+		{request{Username: "mimi_01", Code: "123456", Data: nil}, false, true},
+		{request{Username: "ab", Code: "123456", Data: nil}, false, false},
+		{request{Username: "Mimi", Code: "123456", Data: nil}, false, false},
+		{request{Username: "mimi", Code: "12345", Data: nil}, false, false},
+		{request{Username: "mimi", Code: "12345a", Data: nil}, false, false},
+		{request{Username: "mimi", Code: "123456", Data: nil}, true, false},
+		{request{Username: "mimi", Code: "123456", Data: ok}, true, true},
 	}
 	for i, c := range cases {
 		if got := validate(c.r, c.needData) == ""; got != c.valid {
 			t.Errorf("case %d: valid=%v want %v", i, got, c.valid)
+		}
+	}
+}
+
+func TestAllowOrigin(t *testing.T) {
+	const allowed = "https://imiah.vercel.app/, https://x.github.io"
+	cases := []struct{ origin, allowed, want string }{
+		{"https://imiah.vercel.app", allowed, "https://imiah.vercel.app"},
+		{"https://x.github.io", allowed, "https://x.github.io"},
+		{"http://localhost:5173", allowed, "http://localhost:5173"},
+		{"http://127.0.0.1:3000", allowed, "http://127.0.0.1:3000"},
+		{"https://evil.com", allowed, ""},
+		{"https://anything.com", "", "*"},
+	}
+	for _, c := range cases {
+		if got := allowOrigin(c.origin, c.allowed); got != c.want {
+			t.Errorf("allowOrigin(%q) = %q, want %q", c.origin, got, c.want)
 		}
 	}
 }
